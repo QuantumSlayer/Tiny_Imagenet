@@ -13,6 +13,7 @@ import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 import torch.optim
 from torch.optim.lr_scheduler import StepLR
+from torch.utils.tensorboard import SummaryWriter
 import torch.multiprocessing as mp
 import torch.utils.data
 import torch.utils.data.distributed
@@ -20,9 +21,15 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
 
+writer = SummaryWriter('runs/resnet18_tiny')
+
+# modify resnet18 to fit output of 200 classes
+resnet18_tiny = models.resnet18()
+resnet18_tiny.fc = nn.Linear(512, 200)
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(models.__dict__[name]))
+model_names.append("resnet18_tiny")
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
 parser.add_argument('data', metavar='DIR', default='imagenet',
@@ -136,7 +143,11 @@ def main_worker(gpu, ngpus_per_node, args):
         model = models.__dict__[args.arch](pretrained=True)
     else:
         print("=> creating model '{}'".format(args.arch))
-        model = models.__dict__[args.arch]()
+        # add modified resnet18
+        if args.arch == "resnet18_tiny":
+            model = resnet18_tiny
+        else:
+            model = models.__dict__[args.arch]()
 
     if not torch.cuda.is_available():
         print('using CPU, this will be slow')
@@ -213,8 +224,8 @@ def main_worker(gpu, ngpus_per_node, args):
     train_dataset = datasets.ImageFolder(
         traindir,
         transforms.Compose([
-            transforms.RandomResizedCrop(224),
-            transforms.RandomHorizontalFlip(),
+            # transforms.RandomResizedCrop(224),
+            # transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             normalize,
         ]))
@@ -230,8 +241,8 @@ def main_worker(gpu, ngpus_per_node, args):
 
     val_loader = torch.utils.data.DataLoader(
         datasets.ImageFolder(valdir, transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
+            # transforms.Resize(256),
+            # transforms.CenterCrop(224),
             transforms.ToTensor(),
             normalize,
         ])),
@@ -239,18 +250,22 @@ def main_worker(gpu, ngpus_per_node, args):
         num_workers=args.workers, pin_memory=True)
 
     if args.evaluate:
-        validate(val_loader, model, criterion, args)
+        validate(val_loader, model, criterion, args.start_epoch, args)
         return
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
 
+        # add tensorboard graph
+        if epoch == 0:
+            writer.add_graph(model, torch.rand(1, 3, 64, 64))
+
         # train for one epoch
         train(train_loader, model, criterion, optimizer, epoch, args)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args)
+        acc1 = validate(val_loader, model, criterion, epoch, args)
         
         scheduler.step()
 
@@ -316,9 +331,13 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         if i % args.print_freq == 0:
             progress.display(i)
+    
+    writer.add_scalar('Train/Loss', losses.avg, epoch)
+    writer.add_scalar('Train/Prec@1', top1.avg, epoch)
+    writer.add_scalar('Train/Prec@5', top5.avg, epoch)
 
 
-def validate(val_loader, model, criterion, args):
+def validate(val_loader, model, criterion, epoch, args):
     batch_time = AverageMeter('Time', ':6.3f', Summary.NONE)
     losses = AverageMeter('Loss', ':.4e', Summary.NONE)
     top1 = AverageMeter('Acc@1', ':6.2f', Summary.AVERAGE)
@@ -343,6 +362,16 @@ def validate(val_loader, model, criterion, args):
             output = model(images)
             loss = criterion(output, target)
 
+            # compute output in evaluation
+            if args.evaluate:
+                _, pred = output.topk(5, 1, True, True)
+                pred = pred.t()
+                if i == 0:
+                    save = pred
+                else:
+                    save = torch.cat((save, pred), 1)
+                continue
+
             # measure accuracy and record loss
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
             losses.update(loss.item(), images.size(0))
@@ -355,8 +384,16 @@ def validate(val_loader, model, criterion, args):
 
             if i % args.print_freq == 0:
                 progress.display(i)
+        
+        if args.evaluate:
+            torch.save(save, "result" + str(args.start_epoch) + ".dat")
+            return
+        else:
+            writer.add_scalar('Validate/Loss', losses.avg, epoch)
+            writer.add_scalar('Validate/Prec@1', top1.avg, epoch)
+            writer.add_scalar('Validate/Prec@5', top5.avg, epoch)
 
-        progress.display_summary()
+            progress.display_summary()
 
     return top1.avg
 
